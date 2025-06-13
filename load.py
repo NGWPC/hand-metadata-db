@@ -1,25 +1,23 @@
 #!/usr/bin/env python3
 import argparse
-import tempfile
-import shutil
-import os
-import uuid as py_uuid
-from decimal import Decimal, InvalidOperation
-from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Tuple
 import concurrent.futures
-from pyogrio.errors import DataSourceError
-import fiona
-import threading
+import multiprocessing
+import os
 import queue
-import time
+import tempfile
+import threading
+import uuid as py_uuid
+from decimal import Decimal
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
 
-import pandas as pd
-import geopandas as gpd
-from shapely.geometry.base import BaseGeometry
-from shapely.ops import unary_union
 import duckdb
+import fiona
 import fsspec
+import geopandas as gpd
+import pandas as pd
+from pyogrio.errors import DataSourceError
+from shapely.ops import unary_union
 
 # Connection pool for DuckDB connections
 connection_pool = queue.Queue()
@@ -27,6 +25,7 @@ pool_initialized = False
 pool_lock = threading.Lock()
 
 TMP = tempfile.TemporaryDirectory()
+SENTINEL = object()  # Shutdown signal
 
 
 def initialize_connection_pool(db_path: str, pool_size: int = 8):
@@ -104,9 +103,7 @@ def detect_hydrotable_schema(csv_files: List[str]) -> Dict[str, str]:
     return schema
 
 
-def adapt_hydrotable_schema(
-    conn: duckdb.DuckDBPyConnection, new_schema: Dict[str, str], hand_ver: str
-):
+def adapt_hydrotable_schema(conn: duckdb.DuckDBPyConnection, new_schema: Dict[str, str], hand_ver: str):
     """
     Adapt the Hydrotables schema to include new columns discovered in the CSV files.
     """
@@ -139,9 +136,7 @@ def adapt_hydrotable_schema(
             print(f"Warning: Could not add column {col_name}: {e}")
 
 
-def process_hydrotable_data(
-    df: pd.DataFrame, detected_schema: Dict[str, str]
-) -> pd.DataFrame:
+def process_hydrotable_data(df: pd.DataFrame) -> pd.DataFrame:
     """
     Process hydrotable dataframe with dynamic column handling.
     """
@@ -163,10 +158,13 @@ def process_hydrotable_data(
         elif "calb" in col.lower():
             if col.lower() == "calb_applied":
                 # Convert to boolean - handle various boolean representations
-                df[col] = df[col].map(lambda x: 
-                    True if str(x).lower() in ['true', '1', 'yes', 'y'] 
-                    else False if str(x).lower() in ['false', '0', 'no', 'n']
-                    else None)
+                df[col] = df[col].map(
+                    lambda x: (
+                        True
+                        if str(x).lower() in ["true", "1", "yes", "y"]
+                        else False if str(x).lower() in ["false", "0", "no", "n"] else None
+                    )
+                )
             else:
                 df[col] = pd.to_numeric(df[col], errors="coerce")
 
@@ -183,8 +181,9 @@ def process_hydrotable_data(
         def aggregator(v):
             clean_values = [float(x) for x in v.dropna() if pd.notna(x)]
             return clean_values if clean_values else None  # Return None instead of empty array
+
         return aggregator
-    
+
     def make_boolean_aggregator(column_name):
         return lambda v: v.dropna().iloc[0] if not v.dropna().empty else None
 
@@ -224,9 +223,7 @@ def initialize_database(db_path: str, schema_path: str):
             try:
                 conn.execute(stmt)
             except Exception as e:
-                print(
-                    f"Warning: Failed to execute statement: {stmt[:50]}... Error: {e}"
-                )
+                print(f"Warning: Failed to execute statement: {stmt[:50]}... Error: {e}")
 
     conn.close()
     print(f"Database initialized at: {db_path}")
@@ -357,7 +354,7 @@ def process_branch(args: Tuple[str, str, str]) -> Optional[Dict[str, Any]]:
                 df = pd.concat(pieces, ignore_index=True)
 
                 # Process data with dynamic column handling
-                grp = process_hydrotable_data(df, detected_schema)
+                grp = process_hydrotable_data(df)
 
                 # Collect hydrotable records for batch insertion
                 for _, r in grp.iterrows():
@@ -366,33 +363,19 @@ def process_branch(args: Tuple[str, str, str]) -> Optional[Dict[str, Any]]:
                         "hand_version_id": hand_ver,
                         "HydroID": r["HydroID"],
                         "nwm_feature_id": (
-                            int(r["feature_id"])
-                            if "feature_id" in r.index and pd.notna(r["feature_id"])
-                            else None
+                            int(r["feature_id"]) if "feature_id" in r.index and pd.notna(r["feature_id"]) else None
                         ),
                         "nwm_version_id": (
-                            float(nwm_ver)
-                            if "feature_id" in r.index and pd.notna(r["feature_id"])
-                            else None
+                            float(nwm_ver) if "feature_id" in r.index and pd.notna(r["feature_id"]) else None
                         ),
                         "stage": r["stage"] if "stage" in r.index else None,
-                        "huc_id": (
-                            str(r["HUC"])
-                            if "HUC" in r.index and pd.notna(r["HUC"])
-                            else None
-                        ),
-                        "lake_id": (
-                            str(r["LakeID"])
-                            if "LakeID" in r.index and pd.notna(r["LakeID"])
-                            else None
-                        ),
+                        "huc_id": (str(r["HUC"]) if "HUC" in r.index and pd.notna(r["HUC"]) else None),
+                        "lake_id": (str(r["LakeID"]) if "LakeID" in r.index and pd.notna(r["LakeID"]) else None),
                     }
 
                     # Add dynamic discharge and calb columns
                     for col in grp.columns:
-                        if (
-                            "discharge" in col.lower() or "calb" in col.lower()
-                        ) and col not in hydrotable_record:
+                        if ("discharge" in col.lower() or "calb" in col.lower()) and col not in hydrotable_record:
                             hydrotable_record[col] = r[col] if col in r.index else None
 
                     result_data["hydrotables"].append(hydrotable_record)
@@ -454,11 +437,9 @@ def process_branch(args: Tuple[str, str, str]) -> Optional[Dict[str, Any]]:
         return None
 
 
-def batch_insert_data(
-    db_path: str, batch_data: List[Dict[str, Any]], batch_size: int = 100
-):
+def batch_insert_data(db_path: str, batch_data: List[Dict[str, Any]]):
     """
-    Perform batch insertions into the database.
+    Perform batch insertions into the database using efficient batch operations.
     """
     if not batch_data:
         return
@@ -467,12 +448,11 @@ def batch_insert_data(
 
     try:
         # Load required extensions
-        conn.execute("INSTALL spatial;")
-        conn.execute("LOAD spatial;")
-    except:
-        pass
+        try:
+            conn.execute("INSTALL spatial; LOAD spatial;")
+        except:
+            pass
 
-    try:
         conn.execute("BEGIN TRANSACTION;")
 
         # Collect all unique schemas for adaptation
@@ -480,123 +460,105 @@ def batch_insert_data(
         for data in batch_data:
             if "detected_schema" in data:
                 all_schemas.update(data["detected_schema"])
-
-        # Adapt schema once for all new columns
         if all_schemas:
             adapt_hydrotable_schema(conn, all_schemas, "batch")
 
         # Batch insert catchments
-        catchment_records = []
-        for data in batch_data:
-            if data and "catchment" in data:
-                catchment_records.append(data["catchment"])
-
+        catchment_records = [data["catchment"] for data in batch_data if data and "catchment" in data]
         if catchment_records:
             print(f"Batch inserting {len(catchment_records)} catchments...")
-            for record in catchment_records:
-                conn.execute(
-                    """
-                    INSERT INTO Catchments (catchment_id, hand_version_id, geometry, additional_attributes)
-                    VALUES (?, ?, ST_GeomFromText(?), ?)
-                    ON CONFLICT (catchment_id) DO NOTHING
-                    """,
-                    [
-                        record["catchment_id"],
-                        record["hand_version_id"],
-                        record["geometry_wkt"],
-                        record["additional_attributes"],
-                    ],
-                )
-
-        # Batch insert hydrotables
-        all_hydrotable_records = []
-        for data in batch_data:
-            if data and "hydrotables" in data:
-                all_hydrotable_records.extend(data["hydrotables"])
-
-        if all_hydrotable_records:
-            print(
-                f"Batch inserting {len(all_hydrotable_records)} hydrotable records..."
+            conn.executemany(
+                """
+                INSERT INTO Catchments (catchment_id, hand_version_id, geometry, additional_attributes)
+                VALUES (?, ?, ST_GeomFromText(?), ?)
+                ON CONFLICT (catchment_id) DO NOTHING
+                """,
+                [
+                    (
+                        r["catchment_id"],
+                        r["hand_version_id"],
+                        r["geometry_wkt"],
+                        r["additional_attributes"],
+                    )
+                    for r in catchment_records
+                ],
             )
 
-            # Build dynamic column list from first record
-            if all_hydrotable_records:
-                sample_record = all_hydrotable_records[0]
-                core_columns = [
-                    "catchment_id",
-                    "hand_version_id",
-                    "HydroID",
-                    "nwm_feature_id",
-                    "nwm_version_id",
-                    "stage",
-                    "huc_id",
-                    "lake_id",
-                ]
-                dynamic_columns = [
-                    k
-                    for k in sample_record.keys()
-                    if k not in core_columns
-                    and ("discharge" in k.lower() or "calb" in k.lower())
-                ]
-                all_columns = core_columns + dynamic_columns
-                placeholders = ", ".join(["?"] * len(all_columns))
+        # Batch insert hydrotables
+        all_hydrotable_records = [
+            ht for data in batch_data if data and "hydrotables" in data for ht in data["hydrotables"]
+        ]
+        if all_hydrotable_records:
+            print(f"Batch inserting {len(all_hydrotable_records)} hydrotable records...")
+            sample = all_hydrotable_records[0]
+            core_columns = [
+                "catchment_id",
+                "hand_version_id",
+                "HydroID",
+                "nwm_feature_id",
+                "nwm_version_id",
+                "stage",
+                "huc_id",
+                "lake_id",
+            ]
+            dynamic_columns = [
+                k for k in sample.keys() if k not in core_columns and ("discharge" in k.lower() or "calb" in k.lower())
+            ]
+            all_columns = core_columns + dynamic_columns
 
-                insert_sql = f"""
-                    INSERT INTO Hydrotables ({', '.join(all_columns)})
-                    VALUES ({placeholders})
-                    ON CONFLICT (catchment_id, hand_version_id, HydroID) DO NOTHING
-                """
-
-                for record in all_hydrotable_records:
-                    values = [record.get(col) for col in all_columns]
-                    conn.execute(insert_sql, values)
+            conn.executemany(
+                f"""
+                INSERT INTO Hydrotables ({', '.join(all_columns)})
+                VALUES ({', '.join(['?']*len(all_columns))})
+                ON CONFLICT (catchment_id, hand_version_id, HydroID) DO NOTHING
+                """,
+                [tuple(rec.get(col) for col in all_columns) for rec in all_hydrotable_records],
+            )
 
         # Batch insert REM rasters
-        all_rem_rasters = []
-        for data in batch_data:
-            if data and "rem_rasters" in data:
-                all_rem_rasters.extend(data["rem_rasters"])
-
+        all_rem_rasters = [rr for data in batch_data if data and "rem_rasters" in data for rr in data["rem_rasters"]]
         if all_rem_rasters:
             print(f"Batch inserting {len(all_rem_rasters)} REM rasters...")
-            for record in all_rem_rasters:
-                conn.execute(
-                    """
-                    INSERT INTO HAND_REM_Rasters (rem_raster_id, catchment_id, hand_version_id, raster_path, metadata)
-                    VALUES (?, ?, ?, ?, ?)
-                    ON CONFLICT (rem_raster_id) DO NOTHING
-                    """,
-                    [
-                        record["rem_raster_id"],
-                        record["catchment_id"],
-                        record["hand_version_id"],
-                        record["raster_path"],
-                        record["metadata"],
-                    ],
-                )
+            conn.executemany(
+                """
+                INSERT INTO HAND_REM_Rasters (rem_raster_id, catchment_id, hand_version_id, raster_path, metadata)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT (rem_raster_id) DO NOTHING
+                """,
+                [
+                    (
+                        r["rem_raster_id"],
+                        r["catchment_id"],
+                        r["hand_version_id"],
+                        r["raster_path"],
+                        r["metadata"],
+                    )
+                    for r in all_rem_rasters
+                ],
+            )
 
         # Batch insert catchment rasters
-        all_catchment_rasters = []
-        for data in batch_data:
-            if data and "catchment_rasters" in data:
-                all_catchment_rasters.extend(data["catchment_rasters"])
-
+        all_catchment_rasters = [
+            cr for data in batch_data if data and "catchment_rasters" in data for cr in data["catchment_rasters"]
+        ]
         if all_catchment_rasters:
             print(f"Batch inserting {len(all_catchment_rasters)} catchment rasters...")
-            for record in all_catchment_rasters:
-                conn.execute(
-                    """
-                    INSERT INTO HAND_Catchment_Rasters (catchment_raster_id, rem_raster_id, raster_path, metadata)
-                    VALUES (?, ?, ?, ?)
-                    ON CONFLICT (catchment_raster_id) DO NOTHING
-                    """,
-                    [
-                        record["catchment_raster_id"],
-                        record["rem_raster_id"],
-                        record["raster_path"],
-                        record["metadata"],
-                    ],
-                )
+            conn.executemany(
+                """
+                INSERT INTO HAND_Catchment_Rasters (catchment_raster_id, rem_raster_id, raster_path, metadata)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT (catchment_raster_id) DO NOTHING
+                """,
+                [
+                    (
+                        r["catchment_raster_id"],
+                        r["rem_raster_id"],
+                        r["raster_path"],
+                        r["metadata"],
+                    )
+                    for r in all_catchment_rasters
+                ],
+            )
 
         conn.execute("COMMIT;")
         print(f"Successfully batch inserted data from {len(batch_data)} branches")
@@ -609,12 +571,41 @@ def batch_insert_data(
         conn.close()
 
 
+def batch_writer(db_path: str, result_queue: queue.Queue, batch_size: int):
+    """
+    Batch writer thread that accumulates results and inserts to database
+    when batch size is reached or on shutdown.
+    """
+    batch = []
+    while True:
+        item = result_queue.get()
+        if item is SENTINEL:
+            break
+
+        batch.append(item)
+        if len(batch) >= batch_size:
+            try:
+                batch_insert_data(db_path, batch)
+            except Exception as e:
+                print(f"CRITICAL: Batch insert failed: {e}")
+                raise
+            batch = []
+
+    # Process any remaining items
+    if batch:
+        try:
+            batch_insert_data(db_path, batch)
+        except Exception as e:
+            print(f"CRITICAL: Final batch insert failed: {e}")
+            raise
+
+
 def load_hand_suite(
     db_path: str,
     hand_dir: str,
     hand_ver: str,
     nwm_ver: Decimal,
-    batch_size: int = 100,
+    batch_size: int = 200,
 ):
     """Load HAND data suite into DuckDB with batch processing."""
     # Find all branch dirs
@@ -624,41 +615,36 @@ def load_hand_suite(
         return
 
     print(f"Found {len(branch_dirs)} branch directories to process")
-
-    # Process in parallel batches
     args_list = [(d, hand_ver, str(nwm_ver)) for d in branch_dirs]
-    all_results = []
+
+    # we are doing consumer producer pattern here
+    # result_queue is consumer waiting for data from producers
+    result_queue = queue.Queue()
+    writer_thread = threading.Thread(target=batch_writer, args=(db_path, result_queue, batch_size), daemon=True)
+    writer_thread.start()
+
     successful_count = 0
+    total_count = len(branch_dirs)
 
-    print(f"Processing branches in batches of {batch_size}...")
+    # These are producers that will process branches in parallel
+    with concurrent.futures.ThreadPoolExecutor(max_workers=multiprocessing.cpu_count()) as executor:
+        futures = [executor.submit(process_branch, args) for args in args_list]
 
-    for i in range(0, len(args_list), batch_size):
-        batch_args = args_list[i : i + batch_size]
-        print(
-            f"Processing batch {i//batch_size + 1}/{(len(args_list) + batch_size - 1)//batch_size} ({len(batch_args)} branches)"
-        )
-
-        # Process batch in parallel
-        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
-            batch_results = list(executor.map(process_branch, batch_args))
-
-        # Filter out None results and collect valid data
-        valid_results = [r for r in batch_results if r is not None]
-        successful_count += len(valid_results)
-
-        # Batch insert the collected data
-        if valid_results:
+        for future in concurrent.futures.as_completed(futures):
             try:
-                batch_insert_data(db_path, valid_results)
-                print(
-                    f"  Batch {i//batch_size + 1}: Successfully inserted {len(valid_results)} branches"
-                )
+                result = future.result()
+                if result:
+                    result_queue.put(result)
+                    successful_count += 1
             except Exception as e:
-                print(f"  Batch {i//batch_size + 1}: Failed to insert batch: {e}")
-        else:
-            print(f"  Batch {i//batch_size + 1}: No valid data to insert")
+                print(f"Error processing branch: {e}")
 
-    print(f"Successfully processed {successful_count}/{len(branch_dirs)} branches")
+    # stop the writher thread
+    # and wait for it to finish
+    result_queue.put(SENTINEL)
+    writer_thread.join()
+
+    print(f"Successfully processed {successful_count}/{total_count} branches")
 
 
 def partition_tables_to_parquet(db_path: str, output_dir: str, h3_resolution: int = 1):
@@ -714,15 +700,9 @@ def partition_tables_to_parquet(db_path: str, output_dir: str, h3_resolution: in
               USING RTREE (geometry);
         """
         )
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_hydro_catchment_id ON hydrotables (catchment_id);"
-        )
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_hrr_catchment_id ON hand_rem_rasters (catchment_id);"
-        )
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_hcr_rem_raster_id ON hand_catchment_rasters (rem_raster_id);"
-        )
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_hydro_catchment_id ON hydrotables (catchment_id);")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_hrr_catchment_id ON hand_rem_rasters (catchment_id);")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_hcr_rem_raster_id ON hand_catchment_rasters (rem_raster_id);")
     except Exception as e:
         print(f"Warning: Could not create indexes: {e}")
 
@@ -850,9 +830,7 @@ def main():
             required=True,
             help="Root of your HAND HUC8 tree (local path or s3://…)",
         )
-        p.add_argument(
-            "--hand-version", required=True, help="A text id for this HAND run"
-        )
+        p.add_argument("--hand-version", required=True, help="A text id for this HAND run")
         p.add_argument("--nwm-version", required=True, help="NWM version (decimal)")
         p.add_argument(
             "--init-db",
@@ -877,7 +855,7 @@ def main():
         p.add_argument(
             "--batch-size",
             type=int,
-            default=100,
+            default=200,
             help="Number of branches to process in each batch (default: 100)",
         )
         args = p.parse_args()
@@ -895,13 +873,9 @@ def main():
             nwm_ver = Decimal(args.nwm_version)
 
             if args.skip_load and not db_exists:
-                print(
-                    f"Warning: --skip-load specified but database {args.db_path} does not exist. Loading data..."
-                )
+                print(f"Warning: --skip-load specified but database {args.db_path} does not exist. Loading data...")
 
-            load_hand_suite(
-                args.db_path, args.hand_dir, hand_ver, nwm_ver, args.batch_size
-            )
+            load_hand_suite(args.db_path, args.hand_dir, hand_ver, nwm_ver, args.batch_size)
             print(f"\nData loaded into {args.db_path}")
         else:
             print(f"Skipping data load, using existing database: {args.db_path}")
@@ -909,9 +883,7 @@ def main():
         # Partition tables if output directory is provided
         if args.output_dir:
             print(f"\nPartitioning tables to: {args.output_dir}")
-            partition_tables_to_parquet(
-                args.db_path, args.output_dir, args.h3_resolution
-            )
+            partition_tables_to_parquet(args.db_path, args.output_dir, args.h3_resolution)
 
         print(f"\nDONE.")
 
